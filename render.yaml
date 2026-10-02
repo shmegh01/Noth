@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: spacespy-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python SpaceSpy.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false        # вводится вручную в Render Dashboard → Environment
+      - key: PORT
+        generateValue: false
