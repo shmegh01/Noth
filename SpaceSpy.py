@@ -86,7 +86,7 @@ SETTINGS_FILE = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_settings.json"),
 )
 _SETTINGS_LOCK = threading.RLock()
-_DEFAULT_SETTINGS = {"delete": True, "edit": True}
+_DEFAULT_SETTINGS = {"delete": True, "edit": True, "save": True}
 
 def _load_settings() -> dict[int, dict]:
     try:
@@ -98,6 +98,7 @@ def _load_settings() -> dict[int, dict]:
             int(owner_id): {
                 "delete": bool(values.get("delete", True)),
                 "edit": bool(values.get("edit", True)),
+                "save": bool(values.get("save", True)),
             }
             for owner_id, values in stored.items()
             if isinstance(values, dict)
@@ -129,6 +130,7 @@ def save_settings(owner_id: int) -> None:
         updated = {
             "delete": bool(draft["delete"]),
             "edit": bool(draft["edit"]),
+            "save": bool(draft.get("save", True)),
         }
         candidate = dict(user_settings)
         candidate[owner_id] = updated
@@ -144,6 +146,15 @@ def save_settings(owner_id: int) -> None:
         os.replace(temp_path, SETTINGS_FILE)
         user_settings[owner_id] = updated
         draft_settings.pop(owner_id, None)
+        if not updated["save"]:
+            owner_connections = {
+                connection_id
+                for connection_id, connected_owner in connections.items()
+                if connected_owner == owner_id
+            }
+            for key in list(_cache):
+                if key[0] in owner_connections:
+                    _cache.pop(key, None)
 
 # ── Кэш ───────────────────────────────────────────────────────────────────────
 def cache_put(bc_id, chat_id, msg_id, data):
@@ -248,9 +259,11 @@ def kb_settings(owner_id: int):
     s  = get_draft_settings(owner_id)
     d  = "🟢" if s["delete"] else "🔴"
     e  = "🟢" if s["edit"]   else "🔴"
+    sv = "🟢" if s.get("save", True) else "🔴"
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton(f"Уведомить об удалении | {d}",  callback_data="toggle_delete"))
     kb.add(InlineKeyboardButton(f"Уведомить об изменении | {e}", callback_data="toggle_edit"))
+    kb.add(InlineKeyboardButton(f"Сохранять сообщения в памяти бота | {sv}", callback_data="toggle_save"))
     kb.add(InlineKeyboardButton("💾 Сохранить", callback_data="save_settings"))
     kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back"))
     return kb
@@ -291,7 +304,10 @@ def cb_settings(call):
     bot.answer_callback_query(call.id)
     draft_settings[call.from_user.id] = dict(get_settings(call.from_user.id))
     bot.edit_message_text(
-        "⚙️ <b>Настройки уведомлений</b>",
+        "⚙️ <b>Настройки уведомлений</b>\n\n"
+        "Сохраняемые сообщения нужны для сравнения старого и нового текста. "
+        "Кэш ограничен 20 000 сообщениями и очищается при перезапуске.\n"
+        "Изменения настроек применяются после нажатия «Сохранить».",
         call.message.chat.id,
         call.message.message_id,
         reply_markup=kb_settings(call.from_user.id)
@@ -315,6 +331,18 @@ def cb_toggle_edit(call):
     s["edit"] = not s["edit"]
     state = "включены 🟢" if s["edit"] else "выключены 🔴"
     bot.answer_callback_query(call.id, f"Черновик: уведомления об изменении {state}. Нажмите «Сохранить».")
+    bot.edit_message_reply_markup(
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=kb_settings(call.from_user.id)
+    )
+
+@bot.callback_query_handler(func=lambda c: c.data == "toggle_save")
+def cb_toggle_save(call):
+    s = get_draft_settings(call.from_user.id)
+    s["save"] = not s.get("save", True)
+    state = "включено 🟢" if s["save"] else "выключено 🔴"
+    bot.answer_callback_query(call.id, f"Сохранение сообщений {state}. Нажмите «Сохранить».")
     bot.edit_message_reply_markup(
         call.message.chat.id,
         call.message.message_id,
@@ -378,11 +406,12 @@ def on_business_msg(msg):
         except Exception as e:
             log.error(f"circle: {e}")
 
-    cache_put(bc_id, msg.chat.id, msg.message_id, {
-        "text": extract_text(msg),
-        "name": get_name(msg),
-        "uid":  get_uid(msg),
-    })
+    if owner and get_settings(owner).get("save", True):
+        cache_put(bc_id, msg.chat.id, msg.message_id, {
+            "text": extract_text(msg),
+            "name": get_name(msg),
+            "uid":  get_uid(msg),
+        })
 
 @bot.edited_business_message_handler()
 def on_edited(msg):
@@ -391,7 +420,8 @@ def on_edited(msg):
         return
 
     owner    = connections.get(bc_id)
-    old      = cache_get(bc_id, msg.chat.id, msg.message_id)
+    saving   = bool(owner and get_settings(owner).get("save", True))
+    old      = cache_get(bc_id, msg.chat.id, msg.message_id) if saving else None
     new_text = extract_text(msg)
 
     if old and owner and old["text"] != new_text:
@@ -406,11 +436,12 @@ def on_edited(msg):
             except Exception as e:
                 log.error(f"edited: {e}")
 
-    cache_put(bc_id, msg.chat.id, msg.message_id, {
-        "text": new_text,
-        "name": get_name(msg),
-        "uid":  get_uid(msg),
-    })
+    if saving:
+        cache_put(bc_id, msg.chat.id, msg.message_id, {
+            "text": new_text,
+            "name": get_name(msg),
+            "uid":  get_uid(msg),
+        })
 
 @bot.deleted_business_messages_handler()
 def on_deleted(event):
@@ -432,7 +463,7 @@ def on_deleted(event):
         return
 
     for msg_id in event.message_ids:
-        data = cache_pop(bc_id, chat_id, msg_id)
+        data = cache_pop(bc_id, chat_id, msg_id) if s.get("save", True) else None
 
         text = fmt_deleted(data["name"], data["uid"], data["text"]) if data else (
             f"🗑 Удалено сообщение · не кэшировано\n\n{BOT_TAG}"
